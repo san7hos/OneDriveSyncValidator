@@ -19,6 +19,177 @@ BeforeAll {
 }
 
 # ---------------------------------------------------------------------------
+# Describe: Get-OneDriveIndexFiles
+# ---------------------------------------------------------------------------
+Describe 'Get-OneDriveIndexFiles' {
+
+    Context 'when the folder contains media files' {
+        BeforeAll {
+            $odDir = Join-Path $TestDrive 'od_mixed'
+            $null = New-Item -ItemType Directory -Path $odDir -Force
+            'photo.jpg', 'video.mov', 'doc.pdf', 'audio.mp3' | ForEach-Object {
+                [System.IO.File]::WriteAllBytes((Join-Path $odDir $_), [byte[]]::new($TestFileSize))
+            }
+        }
+
+        It 'returns only files whose extensions match the list' {
+            $result = Get-OneDriveIndexFiles -Path $odDir -Extensions @('.jpg', '.mov')
+            $result.Count | Should -Be 2
+            $result.Name | Should -Contain 'photo.jpg'
+            $result.Name | Should -Contain 'video.mov'
+        }
+
+        It 'returns PSCustomObjects with the required metadata properties' {
+            $result = Get-OneDriveIndexFiles -Path $odDir -Extensions @('.jpg')
+            $item = $result[0]
+            $item.PSObject.Properties.Name | Should -Contain 'Name'
+            $item.PSObject.Properties.Name | Should -Contain 'FullName'
+            $item.PSObject.Properties.Name | Should -Contain 'Length'
+            $item.PSObject.Properties.Name | Should -Contain 'LastWriteTime'
+            $item.PSObject.Properties.Name | Should -Contain 'IsCloudOnly'
+        }
+
+        It 'sets IsCloudOnly to $false for locally present files (no Offline attribute)' {
+            $result = Get-OneDriveIndexFiles -Path $odDir -Extensions @('.jpg')
+            $result[0].IsCloudOnly | Should -BeFalse
+        }
+
+        It 'performs a case-insensitive extension comparison' {
+            $upper = Join-Path $TestDrive 'od_upper'
+            $null = New-Item -ItemType Directory -Path $upper -Force
+            [System.IO.File]::WriteAllBytes((Join-Path $upper 'IMG_001.JPG'), [byte[]]::new($TestFileSize))
+            $result = Get-OneDriveIndexFiles -Path $upper -Extensions @('.jpg')
+            $result.Count | Should -Be 1
+        }
+
+        It 'returns zero results when no files match the extension list' {
+            $result = Get-OneDriveIndexFiles -Path $odDir -Extensions @('.heic')
+            $result | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'when the folder contains subdirectories' {
+        BeforeAll {
+            $root = Join-Path $TestDrive 'od_recurse'
+            $sub1 = Join-Path $root 'Camera Roll'
+            $sub2 = Join-Path $root 'Screenshots'
+            $null = New-Item -ItemType Directory -Path $sub1 -Force
+            $null = New-Item -ItemType Directory -Path $sub2 -Force
+            [System.IO.File]::WriteAllBytes((Join-Path $sub1 'IMG_0001.jpg'),  [byte[]]::new($TestFileSize))
+            [System.IO.File]::WriteAllBytes((Join-Path $sub2 'IMG_0002.heic'), [byte[]]::new($TestFileSize))
+        }
+
+        It 'recursively finds files in sub-directories' {
+            $result = Get-OneDriveIndexFiles -Path $root -Extensions @('.jpg', '.heic')
+            $result.Count | Should -Be 2
+        }
+    }
+
+    Context 'when the folder is empty' {
+        BeforeAll {
+            $empty = Join-Path $TestDrive 'od_empty'
+            $null = New-Item -ItemType Directory -Path $empty -Force
+        }
+
+        It 'returns an empty collection' {
+            $result = Get-OneDriveIndexFiles -Path $empty -Extensions @('.jpg', '.mov')
+            $result | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'cloud-only file detection (Windows Files On-Demand simulation)' {
+        BeforeAll {
+            # Simulating the Windows Offline attribute requires an OS that honors it.
+            # On Linux/macOS the attribute assignment is silently ignored, so we
+            # skip the attribute-dependent tests on those platforms.
+            $script:offlineAttributeSupported = $IsWindows
+
+            $odCloud = Join-Path $TestDrive 'od_cloud'
+            $null = New-Item -ItemType Directory -Path $odCloud -Force
+            $localFile = Join-Path $odCloud 'downloaded.jpg'
+            $cloudFile = Join-Path $odCloud 'cloud_only.jpg'
+            [System.IO.File]::WriteAllBytes($localFile, [byte[]]::new(1000))
+            [System.IO.File]::WriteAllBytes($cloudFile, [byte[]]::new(2000))
+
+            if ($offlineAttributeSupported) {
+                # Simulate the Windows Files On-Demand Offline attribute on the cloud file.
+                $item = Get-Item $cloudFile
+                $item.Attributes = $item.Attributes -bor [System.IO.FileAttributes]::Offline
+            }
+        }
+
+        It 'sets IsCloudOnly to $true for files that carry the Offline attribute' {
+            if (-not $offlineAttributeSupported) {
+                Set-ItResult -Skipped -Because 'FileAttributes.Offline cannot be set on this OS'
+            }
+            $result      = Get-OneDriveIndexFiles -Path $odCloud -Extensions @('.jpg')
+            $cloudEntry  = $result | Where-Object { $_.Name -eq 'cloud_only.jpg' }
+            $cloudEntry | Should -Not -BeNullOrEmpty
+            $cloudEntry.IsCloudOnly | Should -BeTrue
+        }
+
+        It 'sets IsCloudOnly to $false for files without the Offline attribute' {
+            if (-not $offlineAttributeSupported) {
+                Set-ItResult -Skipped -Because 'FileAttributes.Offline cannot be set on this OS'
+            }
+            $result     = Get-OneDriveIndexFiles -Path $odCloud -Extensions @('.jpg')
+            $localEntry = $result | Where-Object { $_.Name -eq 'downloaded.jpg' }
+            $localEntry | Should -Not -BeNullOrEmpty
+            $localEntry.IsCloudOnly | Should -BeFalse
+        }
+
+        It 'includes cloud-only files in the returned collection (not skipped)' {
+            $result = Get-OneDriveIndexFiles -Path $odCloud -Extensions @('.jpg')
+            $result.Count | Should -Be 2
+        }
+
+        It 'reads the correct file size for cloud-only files from the local index' {
+            $result      = Get-OneDriveIndexFiles -Path $odCloud -Extensions @('.jpg')
+            $cloudEntry  = $result | Where-Object { $_.Name -eq 'cloud_only.jpg' }
+            $cloudEntry.Length | Should -Be 2000
+        }
+    }
+
+    Context 'integration with Compare-MediaFiles using OneDrive index objects' {
+        BeforeAll {
+            $srcDir = Join-Path $TestDrive 'od_integ_src'
+            $odIdx  = Join-Path $TestDrive 'od_integ_dest'
+            $null = New-Item -ItemType Directory -Path $srcDir -Force
+            $null = New-Item -ItemType Directory -Path $odIdx  -Force
+
+            # iPhone: 3 files
+            [System.IO.File]::WriteAllBytes((Join-Path $srcDir 'A.jpg'),  [byte[]]::new(1000))
+            [System.IO.File]::WriteAllBytes((Join-Path $srcDir 'B.heic'), [byte[]]::new(2000))
+            [System.IO.File]::WriteAllBytes((Join-Path $srcDir 'C.mov'),  [byte[]]::new(3000))
+
+            # OneDrive index: 2 of the 3 files present (B.heic is missing)
+            [System.IO.File]::WriteAllBytes((Join-Path $odIdx 'A.jpg'),  [byte[]]::new(1000))
+            [System.IO.File]::WriteAllBytes((Join-Path $odIdx 'C.mov'),  [byte[]]::new(3000))
+
+            $script:odSrcFiles  = Get-MediaFiles          -Path $srcDir -Extensions @('.jpg', '.heic', '.mov')
+            $script:odDestFiles = Get-OneDriveIndexFiles  -Path $odIdx  -Extensions @('.jpg', '.heic', '.mov')
+        }
+
+        It 'Compare-MediaFiles accepts Get-OneDriveIndexFiles output as DestinationFiles' {
+            { Compare-MediaFiles -SourceFiles $odSrcFiles -DestinationFiles $odDestFiles } | Should -Not -Throw
+        }
+
+        It 'correctly identifies the file missing from the OneDrive index' {
+            $results = Compare-MediaFiles -SourceFiles $odSrcFiles -DestinationFiles $odDestFiles
+            $missing = @($results | Where-Object { $_.Status -eq 'Missing' })
+            $missing.Count | Should -Be 1
+            $missing[0].FileName | Should -Be 'B.heic'
+        }
+
+        It 'correctly marks files present in the OneDrive index as Synced' {
+            $results = Compare-MediaFiles -SourceFiles $odSrcFiles -DestinationFiles $odDestFiles
+            $synced  = @($results | Where-Object { $_.Status -eq 'Synced' })
+            $synced.Count | Should -Be 2
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Describe: Get-MediaFiles
 # ---------------------------------------------------------------------------
 Describe 'Get-MediaFiles' {

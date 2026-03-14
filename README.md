@@ -1,6 +1,6 @@
 # OneDriveSyncValidator
 
-Scripts for macOS to validate that photos and videos from a connected iPhone have been synced correctly to OneDrive.
+Scripts for macOS and Windows to validate that photos and videos from a connected iPhone have been synced correctly to OneDrive — without downloading any files.
 
 ## Overview
 
@@ -57,7 +57,7 @@ pwsh ./src/Validate-OneDriveSync.ps1 \
 
 ```
 Scanning source files...
-Scanning OneDrive files...
+Scanning OneDrive index (no downloads triggered)...
 Comparing files...
 
 === OneDrive Sync Validation Report ===
@@ -74,6 +74,24 @@ Missing files (2):
   Missing            : 2
   Sync rate          : 99.84%
 ```
+
+Pass `-Verbose` to see a breakdown of how many files are downloaded locally versus cloud-only:
+
+```
+VERBOSE: Found 1243 media file(s) in: /Volumes/iPhone/DCIM
+VERBOSE: OneDrive index: 1241 file(s) in: /Users/you/.../OneDrive-Personal/Pictures  (800 downloaded locally, 441 cloud-only / not downloaded)
+```
+
+## How file comparison works without downloading
+
+The OneDrive destination folder is scanned by `Get-OneDriveIndexFiles`, which reads **only directory-entry metadata** (name, size, last-write time) from the OneDrive local index.  File content is never opened, so **no file downloads or network transfers are triggered**.
+
+| Platform | How cloud-only files are handled |
+|---|---|
+| **macOS** (CloudStorage / NSFileProvider) | All files — whether downloaded or cloud-only — appear in the filesystem with correct metadata. `Get-ChildItem` enumerates them without downloading. |
+| **Windows** (Files On-Demand) | Cloud-only placeholder files carry `FileAttributes.Offline` (and/or `RecallOnDataAccess` on newer builds). Both flags are detected; the file is included in the comparison and reported as `IsCloudOnly = True` in verbose output. |
+
+This means the script works correctly even when OneDrive is configured with **Files On-Demand** and very few (or no) files have been downloaded to the local disk.
 
 ## Running the tests
 

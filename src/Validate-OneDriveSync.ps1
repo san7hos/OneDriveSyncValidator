@@ -2,7 +2,8 @@
 
 <#
 .SYNOPSIS
-    Validates that photos and videos from a connected iPhone have been synced to OneDrive.
+    Validates that photos and videos from a connected iPhone have been synced to
+    OneDrive by comparing metadata only — no files are downloaded.
 
 .DESCRIPTION
     Compares media files (photos and videos) between an iPhone source path and a
@@ -52,6 +53,22 @@
 .NOTES
     Requires PowerShell 7.0 or later (pwsh).
     Designed for macOS with an iPhone connected via USB or mounted with ifuse.
+
+    OneDrive Files On-Demand / no-download guarantee
+    -------------------------------------------------
+    The OneDrive destination folder is scanned by Get-OneDriveIndexFiles, which
+    reads ONLY directory-entry metadata (name, size, last-write time) cached
+    locally by the OneDrive client.  File content is never opened or read, so
+    cloud-only (not yet downloaded) files are included in the comparison without
+    triggering any download or network transfer.
+
+    On Windows, files that have not been downloaded carry the FileAttributes.Offline
+    flag (and/or the RecallOnDataAccess flag for newer OneDrive builds).  The script
+    detects and reports these as cloud-only in verbose output.
+
+    On macOS, the CloudStorage NSFileProvider layer exposes all file metadata
+    through the standard filesystem APIs without requiring content to be present
+    locally; there is no separate Offline flag on that platform.
 #>
 
 [CmdletBinding()]
@@ -171,24 +188,111 @@ function Get-MediaFiles {
     return $files
 }
 
+function Get-OneDriveIndexFiles {
+    <#
+    .SYNOPSIS
+        Returns media file metadata from the OneDrive local index without
+        downloading any file content.
+    .DESCRIPTION
+        Reads only the directory-entry metadata (name, size, last-write time)
+        that the OneDrive client caches locally for every file — regardless of
+        whether the file has been downloaded to this machine.  Because no file
+        content is opened, no network traffic or on-demand recall is triggered.
+
+        This makes the function safe to use even when OneDrive Files On-Demand
+        (cloud-only files) is enabled:
+          • Windows  – cloud-only files carry FileAttributes.Offline (0x1000) and/or
+                       the RecallOnDataAccess attribute (0x400000).  Both are detected
+                       and reflected in the IsCloudOnly property of the returned objects.
+          • macOS    – the NSFileProvider layer exposes all file metadata via the
+                       standard filesystem APIs without requiring local content; there
+                       is no separate Offline flag on macOS, so IsCloudOnly is always
+                       $false there.
+
+    .PARAMETER Path
+        Root of the OneDrive sync folder to scan recursively.
+    .PARAMETER Extensions
+        Array of file extensions to include (e.g. '.jpg', '.heic').
+        Comparison is case-insensitive.
+    .OUTPUTS
+        [PSCustomObject[]]  Each object exposes:
+          Name, FullName, Length, LastWriteTime, IsCloudOnly
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject[]])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string[]]$Extensions
+    )
+
+    $normalised = $Extensions | ForEach-Object { $_.ToLowerInvariant() }
+
+    # Get-ChildItem reads only directory-entry metadata (equivalent to stat())
+    # and does NOT open or read file content.  Cloud-only / Files On-Demand
+    # placeholder files are enumerated with their correct cloud-side metadata.
+    $entries = Get-ChildItem -Path $Path -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $normalised -contains $_.Extension.ToLowerInvariant() }
+
+    # 0x400000 = RecallOnDataAccess — set by newer OneDrive builds on Windows for
+    # cloud-only files in addition to (or instead of) the Offline flag.  This
+    # value is not part of the System.IO.FileAttributes enum in the .NET BCL
+    # (as of .NET 8); we therefore use a raw integer mask to avoid cast errors
+    # on runtimes that reject unknown enum values.
+    $offlineMask            = [int][System.IO.FileAttributes]::Offline  # 0x1000
+    $recallOnDataAccessMask = 0x400000
+
+    $result = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($entry in $entries) {
+        $attrsInt    = [int]$entry.Attributes
+        $isCloudOnly = (($attrsInt -band $offlineMask) -ne 0) -or
+                       (($attrsInt -band $recallOnDataAccessMask) -ne 0)
+
+        $result.Add([PSCustomObject]@{
+            Name          = $entry.Name
+            FullName      = $entry.FullName
+            Length        = $entry.Length
+            LastWriteTime = $entry.LastWriteTime
+            IsCloudOnly   = $isCloudOnly
+        })
+    }
+
+    $arr        = $result.ToArray()
+    $cloudCount = @($arr | Where-Object { $_.IsCloudOnly }).Count
+    $localCount = $arr.Count - $cloudCount
+
+    Write-Verbose "OneDrive index: $($arr.Count) file(s) in: $Path  ($localCount downloaded locally, $cloudCount cloud-only / not downloaded)"
+
+    if ($cloudCount -gt 0) {
+        Write-Verbose "$cloudCount file(s) are cloud-only (Files On-Demand). Their metadata is read from the local OneDrive index without downloading any content."
+    }
+
+    return $arr
+}
+
 function Build-FileIndex {
     <#
     .SYNOPSIS
-        Builds a hashtable lookup from an array of FileInfo objects.
+        Builds a hashtable lookup from an array of file-metadata objects.
     .PARAMETER Files
-        FileInfo objects to index.
+        File-metadata objects to index.  Each object must expose at minimum a
+        'Name' property (string) and, when BySize is $true, a 'Length' property
+        (int64).  Accepts both [System.IO.FileInfo] (from Get-MediaFiles /
+        Get-ChildItem) and [PSCustomObject] (from Get-OneDriveIndexFiles).
     .PARAMETER BySize
         When $true the key is '<lowercased-name>:<length-in-bytes>';
         otherwise the key is just the lowercased file name.
     .OUTPUTS
-        [hashtable]  key -> list of matching FileInfo objects
+        [hashtable]  key -> list of matching file-metadata objects
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [System.IO.FileInfo[]]$Files,
+        [object[]]$Files,
 
         [Parameter()]
         [bool]$BySize = $false
@@ -203,7 +307,7 @@ function Build-FileIndex {
         }
 
         if (-not $index.ContainsKey($key)) {
-            $index[$key] = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+            $index[$key] = [System.Collections.Generic.List[object]]::new()
         }
         $index[$key].Add($file)
     }
@@ -216,9 +320,11 @@ function Compare-MediaFiles {
     .SYNOPSIS
         Compares source media files against the destination to find unsynced files.
     .PARAMETER SourceFiles
-        FileInfo objects from the source (iPhone).
+        File-metadata objects from the source (iPhone).  Accepts [System.IO.FileInfo]
+        or [PSCustomObject] with Name, FullName, Length, LastWriteTime properties.
     .PARAMETER DestinationFiles
-        FileInfo objects from the destination (OneDrive).
+        File-metadata objects from the destination (OneDrive).  Accepts
+        [System.IO.FileInfo] or [PSCustomObject] from Get-OneDriveIndexFiles.
     .PARAMETER CompareBySize
         When $true a match requires both filename and file-size to agree.
     .OUTPUTS
@@ -231,11 +337,11 @@ function Compare-MediaFiles {
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [System.IO.FileInfo[]]$SourceFiles,
+        [object[]]$SourceFiles,
 
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [System.IO.FileInfo[]]$DestinationFiles,
+        [object[]]$DestinationFiles,
 
         [Parameter()]
         [bool]$CompareBySize = $false
@@ -372,8 +478,8 @@ if (-not (Test-Path $OneDrivePath)) {
 Write-Host 'Scanning source files...' -ForegroundColor Cyan
 $sourceFiles = Get-MediaFiles -Path $SourcePath -Extensions $Extensions
 
-Write-Host 'Scanning OneDrive files...' -ForegroundColor Cyan
-$destFiles = Get-MediaFiles -Path $OneDrivePath -Extensions $Extensions
+Write-Host 'Scanning OneDrive index (no downloads triggered)...' -ForegroundColor Cyan
+$destFiles = Get-OneDriveIndexFiles -Path $OneDrivePath -Extensions $Extensions
 
 Write-Host 'Comparing files...'
 $results = Compare-MediaFiles `
