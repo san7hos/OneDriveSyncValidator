@@ -1,0 +1,8 @@
+# Generated inventories and reports may contain private filenames and paths.
+*-inventory.csv
+reports/
+*.log
+
+# PowerShell tooling
+.pester/
+TestResults.xml
